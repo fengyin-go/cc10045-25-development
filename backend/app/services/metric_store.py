@@ -24,6 +24,56 @@ class MetricStoreService(BaseModuleService):
     ACTION_RULES = {"保存快照": "已保存", "标记异常": "有异常"}
     NEGATIVE_ACTIONS = []
 
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        """登记一条指标快照：按指标名称落到 metrics，快照值写入 metric_values。
+
+        metric_values 才是快照的真实存储；metrics 只保存指标定义，
+        这样登记的快照能直接进入按业务日期的口径差异配对。
+        """
+        missing = [
+            field for field in self.REQUIRED_FIELDS
+            if not str(values.get(field) or "").strip()
+        ]
+        if missing:
+            return None, missing
+
+        metric_name = str(values.get("指标名称", "")).strip()
+        metric = db.fetchone("SELECT * FROM metrics WHERE metric_name=?", [metric_name])
+        if metric is None:
+            metric_id = db.insert("metrics", {
+                "metric_name": metric_name,
+                "metric_type": "counter",
+                "source_module": "metric_store",
+                "calibration_version": int(str(values.get("口径版本") or 1) or 1),
+                "unit": "",
+                "description": "由指标快照登记自动创建",
+            })
+        else:
+            metric_id = metric["id"]
+
+        snapshot_time = str(values.get("快照时间", "")).strip()
+        business_date = snapshot_time[:10]
+        try:
+            snapshot_value = float(values.get("快照值"))
+        except (TypeError, ValueError):
+            return None, ["快照值"]
+
+        snapshot_id = db.insert("metric_values", {
+            "metric_id": metric_id,
+            "snapshot_value": round(snapshot_value, 4),
+            "snapshot_time": snapshot_time,
+            "calibration_version": int(str(values.get("口径版本") or 1) or 1),
+            "baseline_value": values.get("对比基准") or None,
+            "comparison_status": "已保存",
+            "business_date": business_date,
+            "sample_no": "",
+            "verified": 1,
+        })
+        db.update(
+            "metric_values", {"sample_no": f"MV-{snapshot_id:06d}"}, "id=?", [snapshot_id]
+        )
+        return db.fetchone("SELECT * FROM metric_values WHERE id=?", [snapshot_id]), []
+
     def list_metrics(self, page: int = 1, size: int = 20) -> tuple[list[dict[str, Any]], int]:
         """列出所有指标定义。"""
         total = db.count("metrics")
@@ -96,6 +146,22 @@ class MetricStoreService(BaseModuleService):
 
     def compare_calibrations(self, metric_id: int, v1: int, v2: int) -> dict[str, Any]:
         """对比同一指标在两个口径版本下的差异。"""
+        # 按业务日期配对逐日口径差异，均值只从真正配对成功的日期计算。
+        from app.services.calibration import build_calibration_diff
+
+        dates = db.fetchall(
+            "SELECT MIN(business_date) AS first_date, MAX(business_date) AS last_date "
+            "FROM metric_values WHERE metric_id=? AND calibration_version IN (?, ?) "
+            "AND business_date IS NOT NULL AND business_date<>''",
+            [metric_id, v1, v2],
+        )
+        first_date = dates[0]["first_date"] if dates else None
+        last_date = dates[0]["last_date"] if dates else None
+        diff_view: dict[str, Any] | None = None
+        if first_date and last_date:
+            diff_view = build_calibration_diff(metric_id, v1, v2, first_date, last_date)
+            diff_view.pop("ok", None)
+
         snapshots_v1 = db.fetchall(
             "SELECT * FROM metric_values WHERE metric_id=? AND calibration_version=? ORDER BY snapshot_time DESC LIMIT 10",
             [metric_id, v1],
@@ -118,6 +184,7 @@ class MetricStoreService(BaseModuleService):
             "mean_b": round(mean_v2, 4),
             "diff_pct": diff_pct,
             "significant": abs(diff_pct) > 5,
+            "daily_diff": diff_view,
         }
 
     def domain_snapshot(self) -> dict[str, Any]:

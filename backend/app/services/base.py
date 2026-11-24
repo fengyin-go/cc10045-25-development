@@ -94,8 +94,9 @@ class BaseModuleService:
         for field in self.LIST_FIELDS:
             col = _to_column_name(field)
             data[col] = values.get(field, "")
-        if "name" not in data and self.LIST_FIELDS:
-            data["name"] = values.get(self.LIST_FIELDS[0], "")
+        # 部分旧表用 name 作为展示名兜底；表里没有这一列时不能硬写。
+        if "name" not in data and _table_has_column(table, "name"):
+            data["name"] = values.get(self.LIST_FIELDS[0], "") if self.LIST_FIELDS else ""
         data["status"] = self.STATUS_ORDER[0]
 
         entry_id = db.insert(table, data)
@@ -127,6 +128,13 @@ class BaseModuleService:
             "by_status": by_status,
             "abnormal": 0,
         }
+
+
+def _table_has_column(table: str, column: str) -> bool:
+    row = db.fetchone(
+        "SELECT 1 AS found FROM pragma_table_info(?) WHERE name=?", [table, column]
+    )
+    return row is not None
 
 
 def _to_column_name(chinese_field: str) -> str:

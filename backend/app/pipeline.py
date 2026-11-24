@@ -261,7 +261,12 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
         "baseline_value": baseline_value,
         "comparison_status": comparison_status,
         "z_score": z_score,
+        "business_date": metric.get("business_date") or now_str[:10],
+        "sample_no": metric.get("sample_no"),
+        "verified": int(metric.get("verified", 1)),
     })
+    if not metric.get("sample_no"):
+        db.update("metric_values", {"sample_no": f"MV-{insert_id:06d}"}, "id=?", [insert_id])
 
     return {
         "id": insert_id,
@@ -1270,5 +1275,39 @@ def seed_real_data() -> dict[str, int]:
             "status": "已生效",
         })
     counts["alerts"] = len(alerts)
+
+    # 口径切换周度核查样本：演示周一两版齐全、周二只到新版的历史现场。
+    calibration_metric_id = db.insert("metrics", {
+        "metric_name": "口径切换周度核查值",
+        "metric_type": "counter",
+        "source_module": "metric_store",
+        "calibration_version": 1,
+        "unit": "次",
+        "description": "口径切换期间按业务日期留存两版采样，用于差异核查与归因交班",
+    })
+    today = datetime.now(timezone.utc).date()
+    monday = today - timedelta(days=today.weekday())
+    tuesday = monday + timedelta(days=1)
+    demo_samples = [
+        (calibration_metric_id, 1, 100.0, monday.isoformat()),
+        (calibration_metric_id, 2, 92.0, monday.isoformat()),
+        (calibration_metric_id, 2, 110.0, tuesday.isoformat()),
+    ]
+    for metric_id, version, value, business_date in demo_samples:
+        sample_id = db.insert("metric_values", {
+            "metric_id": metric_id,
+            "snapshot_value": value,
+            "snapshot_time": f"{business_date}T09:00:00",
+            "calibration_version": version,
+            "baseline_value": None,
+            "comparison_status": "已保存",
+            "business_date": business_date,
+            "sample_no": "",
+            "verified": 1,
+        })
+        db.update(
+            "metric_values", {"sample_no": f"MV-{sample_id:06d}"}, "id=?", [sample_id]
+        )
+    counts["calibration_samples"] = len(demo_samples)
 
     return counts

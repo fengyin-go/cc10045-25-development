@@ -23,14 +23,39 @@ class AnomalyAnalysisService(BaseModuleService):
     ACTION_RULES = {"启动分析": "已完成", "取消分析": "分析失败"}
     NEGATIVE_ACTIONS = []
 
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """通用动作入口：口径核查生成的记录在“启动分析”时按两版采样重算差值，
+        其余记录沿用通用的状态流转。"""
+        entry = self.get_entry(entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        target = self.ACTION_RULES.get(action)
+        if target is None:
+            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+        if action == "启动分析" and self._calibration_verification(entry_id):
+            result = self.run_analysis(entry_id)
+            if not result.get("ok"):
+                return None, result.get("message", "归因分析失败")
+            return self.get_entry(entry_id), f"{self.ENTITY}已按两版采样完成差值核查"
+        db.update("anomaly_analyses", {"status": target}, "id=?", [entry_id])
+        return self.get_entry(entry_id), f"{self.ENTITY}已{action}"
+
     def run_analysis(self, entry_id: int) -> dict[str, Any]:
-        """执行异常归因分析。先加载记录，再调用管线。"""
+        """执行异常归因分析。先加载记录，再调用管线。
+
+        由口径差异核查生成的记录带有 verification 关联：此时以两版实际采样
+        逐日重算差值，生成可核对指标取数的日期记录，而不是回退到通用 z-score。
+        """
         entry = self.get_entry(entry_id)
         if entry is None:
             return {"ok": False, "message": f"分析记录 {entry_id} 不存在"}
 
         # 标记为分析中
         db.update("anomaly_analyses", {"status": "分析中"}, "id=?", [entry_id])
+
+        linked = self._calibration_verification(entry_id)
+        if linked is not None:
+            return self._run_calibration_analysis(entry_id, linked)
 
         analysis_data = {
             "分析对象": entry.get("分析对象"),
@@ -60,6 +85,57 @@ class AnomalyAnalysisService(BaseModuleService):
             "z_score": result.get("z_score", 0),
             "conclusion": conclusion,
             "contributions": contributions,
+        }
+
+    @staticmethod
+    def _calibration_verification(entry_id: int) -> dict[str, Any] | None:
+        return db.fetchone(
+            "SELECT * FROM calibration_verifications WHERE anomaly_analysis_id=?",
+            [entry_id],
+        )
+
+    def _run_calibration_analysis(
+        self, entry_id: int, verification: dict[str, Any],
+    ) -> dict[str, Any]:
+        """以两版实际采样重算逐日差值，并回写归因记录。"""
+        from app.services import calibration
+
+        detail = calibration.refresh_verification(verification["id"])
+        if not detail.get("ok"):
+            db.update("anomaly_analyses", {"status": "分析失败"}, "id=?", [entry_id])
+            return detail
+
+        paired = [day for day in detail["days"] if day["pair_state"] == "paired"]
+        missing = [day for day in detail["days"] if day["pair_state"] != "paired"]
+        ranking = [[day["business_date"], day["diff"]] for day in paired]
+        anomaly_id = detail.get("anomaly_analysis_id")
+        refreshed = db.fetchone("SELECT * FROM anomaly_analyses WHERE id=?", [entry_id])
+        db.update("anomaly_analyses", {
+            "status": "已完成",
+            "contribution_ranking": json.dumps(ranking, ensure_ascii=False),
+            "conclusion": refreshed["conclusion"] if refreshed else "",
+        }, "id=?", [entry_id])
+
+        return {
+            "ok": True,
+            "target": detail["metric_name"],
+            "verification_id": detail["id"],
+            "is_anomaly": bool(paired),
+            "paired_dates": [day["business_date"] for day in paired],
+            "dates_without_pair": [day["business_date"] for day in missing],
+            "date_records": [
+                {
+                    "business_date": day["business_date"],
+                    "pair_state": day["pair_state"],
+                    "value_a": day["value_a"],
+                    "value_b": day["value_b"],
+                    "diff": day["diff"],
+                    "sample_a_no": day["sample_a_no"],
+                    "sample_b_no": day["sample_b_no"],
+                }
+                for day in detail["days"]
+            ],
+            "conclusion": refreshed["conclusion"] if refreshed else "",
         }
 
     def recent_anomalies(self, limit: int = 20) -> list[dict[str, Any]]:

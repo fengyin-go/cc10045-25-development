@@ -90,10 +90,94 @@ DDL_STATEMENTS = [
         baseline_value REAL,
         comparison_status TEXT DEFAULT '已保存',
         z_score REAL,
+        business_date TEXT,
+        sample_no TEXT,
+        verified INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (metric_id) REFERENCES metrics(id)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_mv_metric_time ON metric_values(metric_id, snapshot_time)",
+    "CREATE INDEX IF NOT EXISTS idx_mv_cal_date ON metric_values(metric_id, calibration_version, business_date)",
+
+    # ==================== Calibration Verification Tier ====================
+    """CREATE TABLE IF NOT EXISTS calibration_verifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        metric_id INTEGER NOT NULL,
+        version_a INTEGER NOT NULL,
+        version_b INTEGER NOT NULL,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        requested_by TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT '数据不齐',
+        anomaly_analysis_id INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(metric_id, version_a, version_b, start_date, end_date),
+        FOREIGN KEY (metric_id) REFERENCES metrics(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_cv_metric_range ON calibration_verifications(metric_id, start_date, end_date)",
+
+    """CREATE TABLE IF NOT EXISTS calibration_verification_dates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        verification_id INTEGER NOT NULL,
+        business_date TEXT NOT NULL,
+        sample_a_id INTEGER,
+        sample_b_id INTEGER,
+        value_a REAL,
+        value_b REAL,
+        diff REAL,
+        diff_pct REAL,
+        pair_state TEXT NOT NULL DEFAULT 'no_sample',
+        pair_label TEXT DEFAULT '',
+        verified INTEGER NOT NULL DEFAULT 0,
+        claimed INTEGER NOT NULL DEFAULT 0,
+        claimed_shift TEXT,
+        claimed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(verification_id, business_date),
+        FOREIGN KEY (verification_id) REFERENCES calibration_verifications(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_cvd_verification ON calibration_verification_dates(verification_id)",
+
+    """CREATE TABLE IF NOT EXISTS calibration_handovers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        verification_id INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'week',
+        business_date TEXT,
+        from_shift TEXT NOT NULL DEFAULT '',
+        to_shift TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT '待领取',
+        claimable_count INTEGER NOT NULL DEFAULT 0,
+        claimed_count INTEGER NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (verification_id) REFERENCES calibration_verifications(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_cho_verification ON calibration_handovers(verification_id)",
+
+    """CREATE TABLE IF NOT EXISTS calibration_handover_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        handover_id INTEGER NOT NULL,
+        verification_id INTEGER NOT NULL,
+        verification_date_id INTEGER NOT NULL,
+        business_date TEXT NOT NULL,
+        sample_a_id INTEGER NOT NULL,
+        sample_b_id INTEGER NOT NULL,
+        value_a REAL,
+        value_b REAL,
+        diff REAL,
+        status TEXT NOT NULL DEFAULT '待领取',
+        claimed_shift TEXT,
+        claimed_by TEXT,
+        claimed_at TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(handover_id, verification_date_id),
+        FOREIGN KEY (handover_id) REFERENCES calibration_handovers(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_chitem_handover ON calibration_handover_items(handover_id)",
+    "CREATE INDEX IF NOT EXISTS idx_chitem_date ON calibration_handover_items(verification_date_id)",
 
     # ==================== Segment Tier ====================
     """CREATE TABLE IF NOT EXISTS segments (
@@ -356,6 +440,36 @@ DDL_STATEMENTS = [
 ]
 
 
+def _migrate_legacy_columns(conn: sqlite3.Connection) -> None:
+    """为旧库补齐后加的列；CREATE TABLE IF NOT EXISTS 不会修改既有表结构。"""
+    additions: dict[str, list[tuple[str, str]]] = {
+        "metric_values": [
+            ("business_date", "TEXT"),
+            ("sample_no", "TEXT"),
+            ("verified", "INTEGER NOT NULL DEFAULT 1"),
+        ],
+        "calibration_verification_dates": [
+            ("pair_label", "TEXT DEFAULT ''"),
+        ],
+    }
+    for table, columns in additions.items():
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, ddl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    # 为历史快照回填业务日期，保证按业务日期配对时旧数据也能被看到。
+    conn.execute(
+        "UPDATE metric_values SET business_date = substr(snapshot_time, 1, 10) "
+        "WHERE business_date IS NULL OR business_date = ''"
+    )
+    conn.execute(
+        "UPDATE metric_values SET sample_no = printf('MV-%06d', id) "
+        "WHERE sample_no IS NULL OR sample_no = ''"
+    )
+
+
 class AnalyticsDB:
     """SQLite-backed analytics database with connection pooling and WAL mode."""
 
@@ -371,8 +485,15 @@ class AnalyticsDB:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
+        # 先建表，再补齐旧库缺列，最后建索引：
+        # 新增列上的索引依赖迁移后的表结构。
         for stmt in DDL_STATEMENTS:
-            conn.execute(stmt)
+            if stmt.lstrip().upper().startswith("CREATE TABLE"):
+                conn.execute(stmt)
+        _migrate_legacy_columns(conn)
+        for stmt in DDL_STATEMENTS:
+            if stmt.lstrip().upper().startswith("CREATE INDEX"):
+                conn.execute(stmt)
         conn.commit()
         conn.close()
 

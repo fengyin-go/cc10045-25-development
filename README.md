@@ -11,11 +11,14 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
+│   ├── src/views/CalibrationDiffView.vue   口径差异与归因交班
+│   ├── src/views/AttributionHandoverView.vue 归因交班记录
 │   ├── src/data/modules.ts              18个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/calibration.py  口径核查与归因交班接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
@@ -70,6 +73,40 @@ npm run dev
 | 留存分析 | `retention_analysis` | 留存任务 | 任务名称、行为事件、留存天数 |
 | 漏斗分析器 | `funnel_analyzer` | 漏斗定义 | 漏斗名称、步骤序列、转化窗口小时 |
 | 多维数据集构建 | `cube_builder` | Cube定义 | Cube名称、事实表、维度组合 |
+
+## 口径差异核查与归因交班
+
+指标口径切换后，光有两版均值不足以交接核查。新增一层按业务日期配对的
+领域逻辑，前端入口为侧栏「口径差异」和「归因交班记录」，也可从
+「指标存储」「异常归因」页头进入。
+
+核心约定（`backend/app/services/calibration.py`）：
+
+- 快照落库时带 `business_date`、`calibration_version`、`sample_no`、
+  `verified`；旧库启动时自动补列并回填业务日期。
+- 只有同一指标、同一天、两个口径**各自都有已验证采样**才配对成功；缺一边
+  时值为 `NULL`，不补 0，也不借用其他日期的采样。
+- 差异视图逐日给出两版采样值、差值、配对状态，并单列完全无采样的日期。
+- 从差异列表发起归因核查会生成归因分析器记录；核查日期记录与归因记录
+  共用同一批配对数据，可逐日核对指标取数来源。
+- 交班支持单日或整周：整周要求核查区间内到报日期两版齐全，否则本次不生成
+  可领事项；已领取的日期按“指标 + 两个口径 + 业务日期”记账，不会重复发出。
+- 重跑旧核查只刷新未处置日期，已领取日期连同两个采样编号保持原样可回查。
+
+接口（前缀 `/api/calibration`）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/metrics` | 可核查指标及已有口径版本 |
+| GET | `/diff` | 按业务日期配对的口径差异视图 |
+| GET/POST | `/samples` | 查询/补登某口径某业务日期的已验证采样 |
+| GET/POST | `/verifications` | 核查记录列表/从差异列表发起核查 |
+| GET | `/verifications/{id}` | 核查详情（逐日配对、采样编号、领取状态） |
+| POST | `/verifications/{id}/refresh` | 重跑旧核查，保留已处置日期 |
+| POST | `/verifications/{id}/handovers` | 发起交班（`scope=day|week`） |
+| POST | `/handovers/{id}/claim` | 日班领取交班批次 |
+| GET | `/attribution-handovers` | 归因交班记录（可按 `shift` 汇总本班领取日期） |
+| GET | `/compare` | 两版均值 + 逐日配对明细 |
 
 ## 约定
 

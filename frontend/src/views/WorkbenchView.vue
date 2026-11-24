@@ -6,6 +6,22 @@
         <p class="page-desc">{{ meta.desc }}</p>
       </div>
       <div class="page-actions">
+        <RouterLink
+          v-if="meta.key === 'metric_store'"
+          class="btn"
+          data-testid="open-calibration-diff"
+          to="/calibration-diff"
+        >
+          口径差异与核查
+        </RouterLink>
+        <RouterLink
+          v-if="meta.key === 'anomaly_analysis'"
+          class="btn"
+          data-testid="open-attribution-handovers"
+          to="/attribution-handovers"
+        >
+          归因交班记录
+        </RouterLink>
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
           登记{{ meta.entity }}
         </button>
